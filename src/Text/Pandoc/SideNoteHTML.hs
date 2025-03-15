@@ -1,8 +1,9 @@
-{-# LANGUAGE BangPatterns        #-}
-{-# LANGUAGE DerivingStrategies  #-}
-{-# LANGUAGE LambdaCase          #-}
-{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+
 {- |
    Module      : Text.Pandoc.SideNoteHTML
    Description : Convert pandoc footnotes to sidenotes
@@ -14,28 +15,31 @@
 -}
 module Text.Pandoc.SideNoteHTML (usingSideNotesHTML) where
 
-import Control.Monad (foldM)
-import Control.Monad.State (State, get, modify', runState)
-import Data.Text (Text)
-import Text.Pandoc (runPure, writeHtml5String)
-import Text.Pandoc.Definition (Block (..), Inline (..), Pandoc (..))
-import Text.Pandoc.Options (WriterOptions)
-import Text.Pandoc.Shared (tshow)
-import Text.Pandoc.Walk (walkM)
+import           Control.Monad (foldM)
+import           Control.Monad.State (State, get, modify', runState)
+import           Data.Text (Text)
 import qualified Data.Text as T
+import           Text.Pandoc (runPure, writeHtml5String)
+import           Text.Pandoc.Definition (Block(..), Inline(..), Pandoc(..))
+import           Text.Pandoc.Options (WriterOptions)
+import           Text.Pandoc.Shared (tshow)
+import           Text.Pandoc.Walk (walkM)
 
 -- type NoteType :: Type
-data NoteType = Sidenote | Marginnote
+data NoteType = Sidenote
+              | Marginnote
   deriving stock (Show, Eq)
 
 -- type SidenoteState :: Type
-data SidenoteState = SNS
-  { _writer :: !WriterOptions
-  , counter :: !Int
-  }
+data SidenoteState = SNS { _writer :: !WriterOptions, counter :: !Int }
 
 -- type Sidenote :: Type -> Type
 type Sidenote = State SidenoteState
+
+data SidenoteOptions = SNO { tagType :: Text, tagRole :: Text }
+
+defaultSidenoteOptions :: SidenoteOptions
+defaultSidenoteOptions = SNO { tagType = "aside", tagRole = "note" }
 
 -- | Like 'Text.Pandoc.SideNote.usingSideNotes', but immediately
 -- pre-render the sidenotes.  This has the advantage that sidenotes may
@@ -58,97 +62,123 @@ type Sidenote = State SidenoteState
 -- >     defaultHakyllWriterOptions
 -- >     (usingSideNotesHTML defaultHakyllWriterOptions)
 --
-usingSideNotesHTML :: WriterOptions -> Pandoc -> Pandoc
-usingSideNotesHTML writer (Pandoc meta blocks) =
+usingSideNotesHTMLWith :: SidenoteOptions -> WriterOptions -> Pandoc -> Pandoc
+usingSideNotesHTMLWith opts writer (Pandoc meta blocks) =
   -- Drop a superfluous paragraph at the start of the document.
   Pandoc meta . someStart . walkBlocks (SNS writer 0) $ blocks
- where
-  someStart :: [Block] -> [Block]
-  someStart = \case
-    (Para [Str ""] : bs) -> bs
-    bs                   -> bs
+  where
+    someStart :: [Block] -> [Block]
+    someStart = \case
+      (Para [Str ""]:bs) -> bs
+      bs -> bs
 
-  walkBlocks :: SidenoteState -> [Block] -> [Block]
-  walkBlocks sns = \case
-    []       -> []
-    (b : bs) -> b' <> walkBlocks s' bs
-     where (b', s') = walkM mkSidenote [b] `runState` sns
+    walkBlocks :: SidenoteState -> [Block] -> [Block]
+    walkBlocks sns = \case
+      [] -> []
+      (b:bs) -> b' <> walkBlocks s' bs
+        where
+          (b', s') = walkM (mkSidenote opts) [b] `runState` sns
+
+usingSideNotesHTML :: WriterOptions -> Pandoc -> Pandoc
+usingSideNotesHTML = usingSideNotesHTMLWith defaultSidenoteOptions
 
 -- Sidenotes can probably appear in more places; this should be
 -- filled-in at some point.
-mkSidenote :: [Block] -> Sidenote [Block]
-mkSidenote = foldM (\acc b -> (acc <>) <$> single b) []
- where
-  -- Try to find and render a sidenote in a single block.
-  single :: Block -> Sidenote [Block]
-  single = \case
-    -- Simulate a paragraph by inserting a dummy block; this is needed
-    -- in case two consecutive paragraphs have sidenotes, or a paragraph
-    -- doesn't have one at all.
-    Para inlines         -> (Para [Str ""] :) <$> renderSidenote [] inlines
-    Plain inlines        -> renderSidenote [] inlines
-    OrderedList attrs bs -> (:[]) . OrderedList attrs <$> traverse mkSidenote bs
-    BulletList        bs -> (:[]) . BulletList        <$> traverse mkSidenote bs
-    block                -> pure [block]
+mkSidenote :: SidenoteOptions -> [Block] -> Sidenote [Block]
+mkSidenote opts = foldM (\acc b -> (acc <>) <$> single b) []
+  where
+    -- Try to find and render a sidenote in a single block.
+    single :: Block -> Sidenote [Block]
+    single = \case
+      -- Simulate a paragraph by inserting a dummy block; this is needed
+      -- in case two consecutive paragraphs have sidenotes, or a paragraph
+      -- doesn't have one at all.
+      Para inlines -> (Para [Str ""]:) <$> renderSidenote opts [] inlines
+      Plain inlines -> renderSidenote opts [] inlines
+      OrderedList attrs bs -> (:[]) . OrderedList attrs
+        <$> traverse (mkSidenote opts) bs
+      BulletList bs -> (:[]) . BulletList <$> traverse (mkSidenote opts) bs
+      block -> pure [block]
 
-renderSidenote :: [Inline] -> [Inline] -> Sidenote [Block]
-renderSidenote !inlines = \case
-  []           -> pure [plain inlines]
-  Note bs : xs -> do block <- go bs
-                     mappend [ -- Start gluing before, see [Note Comment].
-                               plain (RawInline "html" commentStart : inlines)
-                             , block
-                             ]
-                         <$> renderSidenote
-                               [RawInline "html" commentEnd] -- End gluing after
-                               xs
-  b       : xs -> renderSidenote (b : inlines) xs
- where
-  go :: [Block] -> Sidenote Block
-  go blocks = do
-    SNS w i <- get <* modify' (\sns -> sns{ counter = 1 + counter sns })
-    let (typ, noteText) = getNoteType (render w blocks)
-    pure . RawBlock "html" $
-      mconcat [ commentEnd     -- End gluing before
-              , label typ i <> input i <> note typ noteText
-              , commentStart   -- Start gluing after
-              ]
+renderSidenote :: SidenoteOptions -> [Inline] -> [Inline] -> Sidenote [Block]
+renderSidenote opts !inlines = \case
+  []         -> pure [plain inlines]
+  Note bs:xs -> do
+    block <- go bs
+    mappend   -- Start gluing before, see [Note Comment].
+      [plain (RawInline "html" commentStart:inlines), block]
+      <$> renderSidenote
+        opts
+        [RawInline "html" commentEnd] -- End gluing after
+        xs
+  b:xs       -> renderSidenote opts (b:inlines) xs
+  where
+    go :: [Block] -> Sidenote Block
+    go blocks = do
+      SNS w i <- get <* modify' (\sns -> sns { counter = 1 + counter sns })
+      let (typ, noteText) = getNoteType (render w blocks)
+      pure . RawBlock "html"
+        $ mconcat
+          [ commentEnd     -- End gluing before
+          , label typ i <> input i <> note opts typ noteText
+          , commentStart   -- Start gluing after
+          ]
 
-  -- The '{-}' symbol differentiates between margin note and side note.
-  getNoteType :: Text -> (NoteType, Text)
-  getNoteType t
-    | "{-} " `T.isPrefixOf` t = (Marginnote, T.drop 4 t)
-    | otherwise               = (Sidenote  , t)
+    -- The '{-}' symbol differentiates between margin note and side note.
+    getNoteType :: Text -> (NoteType, Text)
+    getNoteType t
+      | "{-} " `T.isPrefixOf` t = (Marginnote, T.drop 4 t)
+      | otherwise = (Sidenote, t)
 
-  render :: WriterOptions -> [Block] -> Text
-  render w bs = case runPure (writeHtml5String w (Pandoc mempty bs)) of
-    Left  err -> error $ "Text.Pandoc.SideNoteHTML.writePandocWith: " ++ show err
-    Right txt -> T.drop 1 (T.dropWhile (/= '\n') txt)
+    render :: WriterOptions -> [Block] -> Text
+    render w bs = case runPure (writeHtml5String w (Pandoc mempty bs)) of
+      Left err
+        -> error $ "Text.Pandoc.SideNoteHTML.writePandocWith: " ++ show err
+      Right txt -> T.drop 1 (T.dropWhile (/= '\n') txt)
 
-  commentEnd :: T.Text
-  commentEnd   = "-->"
+    commentEnd :: T.Text
+    commentEnd = "-->"
 
-  commentStart :: T.Text
-  commentStart = "<!--"
+    commentStart :: T.Text
+    commentStart = "<!--"
 
-  plain :: [Inline] -> Block
-  plain = Plain . reverse
+    plain :: [Inline] -> Block
+    plain = Plain . reverse
 
 label :: NoteType -> Int -> Text
-label nt i = "<label for=\"sn-" <> tshow i <> "\" class=\"margin-toggle" <> sidenoteNumber <> "\">" <> altSymbol <> "</label>"
- where
-  sidenoteNumber :: Text = case nt of
-    Sidenote   -> " sidenote-number"
-    Marginnote -> ""
-  altSymbol :: Text = case nt of
-    Sidenote   -> ""
-    Marginnote -> "&#8853;"
+label nt i = "<label for=\"sn-"
+  <> tshow i
+  <> "\" class=\"margin-toggle"
+  <> sidenoteNumber
+  <> "\">"
+  <> altSymbol
+  <> "</label>"
+  where
+    sidenoteNumber :: Text = case nt of
+      Sidenote   -> " sidenote-number"
+      Marginnote -> ""
+
+    altSymbol :: Text = case nt of
+      Sidenote   -> ""
+      Marginnote -> "&#8853;"
 
 input :: Int -> Text
-input i = "<input type=\"checkbox\" id=\"sn-" <> tshow i <> "\" class=\"margin-toggle\"/>"
+input i = "<input type=\"checkbox\" id=\"sn-"
+  <> tshow i
+  <> "\" class=\"margin-toggle\"/>"
 
-note :: NoteType -> Text -> Text
-note nt body = "<div class=\"" <> T.toLower (tshow nt) <> "\">" <> body <> "</div>"
+note :: SidenoteOptions -> NoteType -> Text -> Text
+note opts nt body = "<"
+  <> tagType opts
+  <> " class=\""
+  <> T.toLower (tshow nt)
+  <> "\" role=\""
+  <> tagRole opts
+  <> "\">"
+  <> body
+  <> "</"
+  <> tagType opts
+  <> ">"
 
 {- [Note Comment]
 
